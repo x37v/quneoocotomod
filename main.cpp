@@ -3,15 +3,26 @@
 #include <chrono>
 #include <thread>
 #include <memory>
+#include <fstream>
+#include <limits>
+#include <signal.h>
+#include <yaml-cpp/yaml.h>
 
 using std::cout;
+using std::cerr;
 using std::endl;
 using std::string;
+
+bool should_exit = false;
 
 const uint8_t nrpn_chan = 15;
 const uint16_t nrpn_center = (1 << 13);
 
 std::shared_ptr<midicpp::Output> midiout;
+
+void sighandler(int sig) {
+  should_exit = true;
+}
 
 int pad_rm(int num) {
   return (num % 4) + 4 * (3 - num / 4);
@@ -42,12 +53,15 @@ class pad_note_t {
     }
     void coarse(uint16_t v) { mCoarse = v; }
     void fine(int16_t v) { mFine = v; }
+
+    uint16_t coarse() const { return mCoarse; }
+    int16_t fine() const { return mFine; }
   private:
     uint16_t mCoarse = nrpn_center + nrpn_center / 2;
     int16_t mFine = 0;
 };
 
-pad_note_t pad_notes[16];
+std::vector<pad_note_t> pad_notes(16);
 
 void pad(pad_t trig, int num, int val) {
   //cout << "pad: " << num << " " << to_string(trig) << "\t" << val << endl;
@@ -71,6 +85,39 @@ void pad(pad_t trig, int num, int val) {
     default:
       break;
   }
+}
+
+void read_settings(std::string path) {
+  {
+    std::ifstream file(path);
+    if (!file) {
+      cerr << "no settings file at " << path << endl;
+      return;
+    }
+  }
+
+  YAML::Node yaml = YAML::LoadFile(path);
+  if (yaml["pads"]) {
+    for (int i = 0; i < std::min(yaml["pads"].size(), pad_notes.size()); i++) {
+      pad_notes[i].fine(yaml["pads"][i]["fine"].as<int16_t>());
+      pad_notes[i].coarse(yaml["pads"][i]["coarse"].as<uint16_t>());
+    }
+  }
+}
+
+void write_settings(std::string path) {
+  std::ofstream file(path);
+  YAML::Node yaml;
+
+  YAML::Node pads;
+  for (auto p: pad_notes) {
+    YAML::Node n;
+    n["fine"] = p.fine();
+    n["coarse"] = p.coarse();
+    pads.push_back(n);
+  }
+  yaml["pads"] = pads;
+  file << yaml << endl;
 }
 
 void cc_cb(uint8_t chan, uint8_t num, uint8_t val) {
@@ -106,6 +153,13 @@ void note_cb(bool on, uint8_t chan, uint8_t num, uint8_t vel) {
 }
 
 int main(int argc, char *argv[]) {
+  if (argc <= 1)
+    read_settings("settings.yaml");
+  else
+    read_settings(argv[1]);
+  
+  signal(SIGINT, &sighandler);
+
   cout << "inputs: " << midicpp::Input::device_count() << endl;
   for (std::string n: midicpp::Input::device_list())
     cout << "\t" << n << endl;
@@ -130,10 +184,11 @@ int main(int argc, char *argv[]) {
   //out.note(false, 0, 112, 0);
   midiout->nrpn(15, 0, (1 << 13));
 
-  while (1) {
+  while (!should_exit) {
     in.process();
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
+  write_settings("settings.yaml");
 
   return 0;
 }
