@@ -14,6 +14,7 @@ using std::endl;
 using std::string;
 
 bool should_exit = false;
+unsigned int last_pad = 0;
 
 const uint8_t nrpn_chan = 15;
 const uint16_t nrpn_center = (1 << 13);
@@ -48,27 +49,41 @@ string to_string(pad_t t) {
 
 class pad_note_t {
   public:
-    uint16_t value() const {
-      return mCoarse + mFine;
+    pad_note_t() {
+      for (int i = 0; i < 2; i++) {
+        mCoarse.push_back(nrpn_center + nrpn_center / 2);
+        mFine.push_back(0);
+      }
     }
-    void coarse(uint16_t v) { mCoarse = v; }
-    void fine(int16_t v) { mFine = v; }
+    uint16_t value(uint8_t index) const {
+      return mCoarse[index] + mFine[index];
+    }
+    void coarse(uint8_t index, uint16_t v) { mCoarse[index] = v; }
+    void fine(uint8_t index, int16_t v) { mFine[index] = v; }
 
-    uint16_t coarse() const { return mCoarse; }
-    int16_t fine() const { return mFine; }
+    uint16_t coarse(uint8_t index) const { return mCoarse[index]; }
+    int16_t fine(uint8_t index) const { return mFine[index]; }
+
+    unsigned int num_notes() { return mCoarse.size(); }
   private:
-    uint16_t mCoarse = nrpn_center + nrpn_center / 2;
-    int16_t mFine = 0;
+    std::vector<uint16_t> mCoarse;
+    std::vector<int16_t> mFine;
 };
 
 std::vector<pad_note_t> pad_notes(16);
+
+void send_note(int pad_num) {
+  midiout->nrpn(nrpn_chan, 0, pad_notes[pad_num].value(0));
+  midiout->nrpn(nrpn_chan, 1, pad_notes[pad_num].value(1));
+}
 
 void pad(pad_t trig, int num, int val) {
   //cout << "pad: " << num << " " << to_string(trig) << "\t" << val << endl;
 
   switch (trig) {
     case P_NOTE_ON:
-      midiout->nrpn(nrpn_chan, 0, pad_notes[num].value());
+      last_pad = num;
+      send_note(num);
       midiout->nrpn(nrpn_chan, 7, nrpn_center + nrpn_center * (val / 127.0));
       break;
     case P_PRESSURE:
@@ -99,8 +114,10 @@ void read_settings(std::string path) {
   YAML::Node yaml = YAML::LoadFile(path);
   if (yaml["pads"]) {
     for (int i = 0; i < std::min(yaml["pads"].size(), pad_notes.size()); i++) {
-      pad_notes[i].fine(yaml["pads"][i]["fine"].as<int16_t>());
-      pad_notes[i].coarse(yaml["pads"][i]["coarse"].as<uint16_t>());
+      for (int j = 0; j < yaml["pads"][i].size(); j++) {
+        pad_notes[i].fine(yaml["pads"][i][j]["fine"].as<int16_t>());
+        pad_notes[i].coarse(yaml["pads"][i][j]["coarse"].as<uint16_t>());
+      }
     }
   }
 }
@@ -111,10 +128,14 @@ void write_settings(std::string path) {
 
   YAML::Node pads;
   for (auto p: pad_notes) {
-    YAML::Node n;
-    n["fine"] = p.fine();
-    n["coarse"] = p.coarse();
-    pads.push_back(n);
+    YAML::Node notes;
+    for (int i = 0; i < p.num_notes(); i++) {
+      YAML::Node n;
+      n["fine"] = p.fine(i);
+      n["coarse"] = p.coarse(i);
+      notes.push_back(n);
+    }
+    pads.push_back(notes);
   }
   yaml["pads"] = pads;
   file << yaml << endl;
@@ -138,6 +159,13 @@ void cc_cb(uint8_t chan, uint8_t num, uint8_t val) {
   } else if (num == 10) {  //xfade high on right
     midiout->nrpn(nrpn_chan, 3, nrpn_center + nrpn_center * (val / 127.0));
     return;
+  } else if (num < 4) {
+    if (num % 2 == 0) {
+      pad_notes[last_pad].coarse(num / 2, static_cast<uint16_t>(val) * 130);
+    } else {
+      pad_notes[last_pad].fine(num / 2, (static_cast<int16_t>(val) - 64) * 2);
+    }
+    send_note(last_pad);
   }
 }
 
@@ -160,21 +188,29 @@ int main(int argc, char *argv[]) {
   
   signal(SIGINT, &sighandler);
 
+  std::string quneo("QUNEO");
+  std::string xnormidi("xnormidi");
+
   cout << "inputs: " << midicpp::Input::device_count() << endl;
-  for (std::string n: midicpp::Input::device_list())
+  for (std::string n: midicpp::Input::device_list()) {
+    if (n.find("QUNEO") != std::string::npos)
+      quneo = n;
     cout << "\t" << n << endl;
+  }
 
   cout << "outputs: " << midicpp::Output::device_count() << endl;
-  for (std::string n: midicpp::Output::device_list())
+  for (std::string n: midicpp::Output::device_list()) {
+    if (n.find("xnormidi") != std::string::npos)
+      xnormidi = n;
     cout << "\t" << n << endl;
+  }
 
   for (int i = 0; i < 16; i++) {
     pad_notes[i].coarse(i * 1000 + nrpn_center);
   }
 
-  midicpp::Input in("QUNEO 28:0");
-  midiout = std::make_shared<midicpp::Output>("xnormidi:0");
-  //midicpp::Output out("Midi Through:0");
+  midicpp::Input in(quneo);
+  midiout = std::make_shared<midicpp::Output>(xnormidi);
 
   in.with_message3(midicpp::CC, cc_cb);
   in.with_note(note_cb);
